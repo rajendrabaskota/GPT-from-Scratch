@@ -20,6 +20,6 @@
 * Model trained on Machine Translation Data Set of parliament hearings (https://www.kaggle.com/datasets/aadishjoshi/machine-translation-data-set)
 * Minimum obtained test loss with above hyperparameters: 3.428
 
-![test-loss](https://github.com/rajendrabaskota/GPT-from-Scratch/assets/66084649/d6474571-546d-470b-be52-b266c35e3a2f)
+![test-loss-2](https://github.com/rajendrabaskota/GPT-from-Scratch/assets/66084649/1fced850-9b66-4515-a4ed-a7d466274816)
 
-![train-loss](https://github.com/rajendrabaskota/GPT-from-Scratch/assets/66084649/75e0804d-ce62-4862-a873-7cfa5e43280a)
+![train-loss](https://github.com/rajendrabaskota/GPT-from-Scratch/assets/66084649/b2d6deb4-ac7d-4748-a6cc-3e5382e26c0d)
