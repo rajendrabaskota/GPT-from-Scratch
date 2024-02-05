@@ -21,4 +21,5 @@
 * Minimum obtained test loss with above hyperparameters: 3.428
 
 ![test-loss](https://github.com/rajendrabaskota/GPT-from-Scratch/assets/66084649/d6474571-546d-470b-be52-b266c35e3a2f)
+
 ![train-loss](https://github.com/rajendrabaskota/GPT-from-Scratch/assets/66084649/75e0804d-ce62-4862-a873-7cfa5e43280a)
