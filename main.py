@@ -3,96 +3,89 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 import torch.multiprocessing as mp
+import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 import re
 import os
+import json
+import wandb
+import subprocess
+from copy import deepcopy
 from tqdm import tqdm
 torch.manual_seed(1337)
+
+os.environ["WANDB_API_KEY"] = "<your_api_key>"
 
 def ddp_setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
-    
+
     init_process_group(backend='nccl', world_size=world_size, rank=rank)
 
-batch_size = 64
+
+batch_size = 32
 block_size = 256 # window length
-n_embd = 384 # dimension of embedding vector
-n_head = 6 # number of heads in multi_head attention
-n_layers = 6 # number of decoder layers Nx
-dropout_rate = 0.2
+n_embd = 512 # dimension of embedding vector
+n_head = 8 # number of heads in multi_head attention
+n_layers = 8 # number of decoder layers Nx
+dropout_rate = 0.1
 eval_iters = 200 # take average of eval_iters output while evaluating
 eval_interval = 500 # evaluate every eval_interval
-learning_rate = 3e-4
-train_ratio = 0.9 # train-test-split
+save_interval = 1000
+total_iters = 20000
+learning_rate = 3e-2
+train_ratio = 0.98 # train-test-split
+num_gradient_accumulation = 16
+lr_scheduling_rate = 0.1
 
-# prev_model = False
-# if prev_model:
-#     checkpoint_path = "/kaggle/working/checkpoint-500.pth.tar"
 
-# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def load_tokenized():
+    tokenized_data = torch.load("/kaggle/input/bpe-using-library/tokenized_data.pt")
+    input_ids = tokenized_data['input_ids']
+    vocab_size = tokenized_data['vocab_size']
 
-def prepare_data():
-    text = ""
-    # for book in books:
-    #     with open("/kaggle/input/bookcropus/books1/epubtxt/"+book, 'r', encoding='utf-8') as f:
-    #         a_book = f.read()
-    #         a_book = a_book.lower()
-    #     text += a_book
+    return input_ids, vocab_size
 
-    with open("/kaggle/input/tiny-shakespeare/input.txt", 'r', encoding='utf-8') as f:
-        a_book = f.read()
-        a_book = a_book.lower()
-    text += a_book
 
-    print(f"Number of characters: {len(text)}")
-    print(f"Number of words: {len(text.split())}") #number of words
-
-    vocab_list = re.findall(r'\w+|[^\w\S]+|[^\w]', text)
-    vocab_list = sorted(list(set(vocab_list)))
-    vocab_size = len(vocab_list)
-    print(f"Vocab size: {vocab_size}")
-
-    stoi = {value: key for key, value in enumerate(vocab_list)}
-    itos = {key: value for value, key in stoi.items()}
-    encode = lambda x: [stoi[_] for _ in x]
-    decode = lambda x: ''.join(itos[_] for _ in x)
-
-    data = torch.tensor(encode(re.findall(r'\w+|[^\w\S]+|[^\w]', text)))
-
+def train_test_split(data):
     n = int(train_ratio * len(data))
     x_train = data[:n]
     x_val = data[n:]
 
-    return x_train.view(1, -1), x_val.view(1, -1), vocab_size
+    return x_train.view(-1), x_val.view(-1)
 
 
 class CustomDataset(torch.utils.data.Dataset):
     def __init__(self, x):
         super(CustomDataset, self).__init__()
         self.x = x
-        
+
     def __len__(self):
-        return self.x.shape[0] - 2*block_size - 1
-    
+        return self.x.shape[0] - block_size - 1
+
+    def __iter__(self):
+        return iter(self.x)
+
     def __getitem__(self, idx):
         return self.x[idx : idx+block_size], self.x[idx+1 : idx+block_size+1]
+
 
 def prepare_dataloader(dataset):
     dataloader = torch.utils.data.DataLoader(dataset=dataset,
                                       batch_size=batch_size,
                                       shuffle=False,
                                       pin_memory=True,
-                                      sampler=DistributedSampler(dataset))
+                                      sampler=DistributedSampler(dataset)
+                                            )
     return dataloader
 
 
 class Head(nn.Module):
     # ONE HEAD OF SELF-ATTENTION
-    
+
     def __init__(self, head_size, gpu_id):
         # The head size is denoted by dk in the paper
         # The dimension of head size is generally equal to the dimension of the embedding vector
@@ -105,7 +98,7 @@ class Head(nn.Module):
                              # Registers a buffer that is not considered a model parameter
                             # Here tril isn't a model parameter to learn. so we register it as a buffer
         self.dropout = nn.Dropout(dropout_rate)
-        
+
     def forward(self, x):
         B, T, C = x.shape # C is equal to the head size
         k = self.key(x) # gives output (B, T, C)
@@ -119,7 +112,7 @@ class Head(nn.Module):
         wei = F.softmax(wei, -1)
         wei = self.dropout(wei)
         out = wei @ v
-        
+
         return out
 
 
@@ -130,7 +123,7 @@ class MultiHeadAttention(nn.Module):
         self.heads = nn.ModuleList([Head(head_size, self.gpu_id) for _ in range(num_heads)])
         self.projection = nn.Linear(n_embd, n_embd)
         self.dropout = nn.Dropout(dropout_rate)
-        
+
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.projection(out))
@@ -142,11 +135,11 @@ class FeedForwardNetwork(nn.Module):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(n_embd, 4*n_embd),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4*n_embd, n_embd), # the projection layer
             nn.Dropout(dropout_rate)
         )
-        
+
     def forward(self, x):
         return self.network(x)
 
@@ -163,12 +156,13 @@ class Block(nn.Module):
         self.FFN = FeedForwardNetwork(n_embd=n_embd)
         self.layer_norm1 = nn.LayerNorm(n_embd)
         self.layer_norm2 = nn.LayerNorm(n_embd)
-        
+
     def forward(self, x):
         x = x + self.sa_head(self.layer_norm1(x)) # implementing skip connection/skip connection
         x = x + self.FFN(self.layer_norm2(x)) # implementing skip connection/skip connection
-        
+
         return x
+
 
 class GPTLanguageModel(nn.Module):
     def __init__(self, gpu_id, vocab_size):
@@ -178,21 +172,21 @@ class GPTLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(self.vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head, gpu_id) for _ in range(n_layers)])
-        
+
         self.layer_norm = nn.LayerNorm(n_embd) # the final layer norm
         self.lm_head = nn.Linear(n_embd, self.vocab_size)
-        
+
         self.apply(self._init_weights)
-        
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-                
+
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        
+
     def forward(self, idx, target=None):
         B, T = idx.shape
         tok_emb = self.token_embedding_table(idx) #token embeddings, gives output of shape (B, T, C) here C = n_embd = 32
@@ -201,8 +195,8 @@ class GPTLanguageModel(nn.Module):
         x = self.blocks(x)
         x = self.layer_norm(x)
         logits = self.lm_head(x) # output of shape (B, T, vocab_size)
-        
-        
+
+
         # Explanation of B, T, C
         # B- batch dimension
         # T - time dimension (timestep) in this project one character=one timestep
@@ -218,7 +212,7 @@ class GPTLanguageModel(nn.Module):
             loss = F.cross_entropy(logits, target)
 
         return logits, loss
-    
+
     def generate(self, idx, max_new_tokens): # generates output given idx ie, the starting token
         # idx is (B, T) array of indices
         for _ in range(max_new_tokens):
@@ -243,14 +237,45 @@ class GPTLanguageModel(nn.Module):
 
 
 class Trainer:
-    def __init__(self, rank, world_size, model, optimizer, epochs):
+    def __init__(self, rank, world_size, model, optimizer, learning_rate, num_iter, num_gradient_accum, lr_scheduling_rate):
         self.gpu_id = rank
         self.world_size = world_size
         self.model = model
         self.optimizer = optimizer
-        self.epochs = epochs
-        # self.model = DDP(self.model, device_ids=[self.gpu_id])
-        
+        self.num_iter = num_iter
+        self.learning_rate = learning_rate
+        self.num_gradient_accum = num_gradient_accum
+        self.lr_scheduling_rate = lr_scheduling_rate
+
+    def lr_scheduling(self):
+        temp = deepcopy(self.optimizer.state_dict())
+        self.learning_rate = self.learning_rate * self.lr_scheduling_rate
+        temp['param_groups'][0]['lr'] = self.learning_rate
+        self.optimizer.load_state_dict(temp)
+
+    def push_to_hub(self, current_iter):
+        state = {
+            'model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'current_iter': current_iter
+        }
+        torch.save(state, "gpt-model-embed-dim-512-batch-32-layers-8-lr-1.2e-3.pt")
+
+        result = subprocess.run('git add .', shell=True)
+        result = subprocess.run('git commit -m new-checkpoint', shell=True)
+        result = subprocess.run('git push', shell=True)
+
+    def setup_wandb(self):
+        wandb.init(
+        project = "embed-dim-512-batch-32-layers-8-lr-1.2e-3",
+        config = {
+            "learning_rate": self.learning_rate,
+            "architecture": "GPT",
+            "dataset": "law-hearings-machine-translation-danish",
+            "steps": self.num_iter
+        }
+    )
+
     def train(self, X_train, X_val):
         X_train = X_train.view(-1)
         X_val = X_val.view(-1)
@@ -259,27 +284,97 @@ class Trainer:
         self.model = self.model.to(self.gpu_id)
         self.model = DDP(self.model, device_ids=[self.gpu_id])
 
-        for epoch in tqdm(range(self.epochs)):
-            # self.train_data.sampler.set_epoch(epoch)
-            print(f"Epoch: {epoch}")
-            for data, target in train_dl: # each loop gives a batch of data as specified in the dataloader
-                logits, loss = self.model(data.to(self.gpu_id), target.to(self.gpu_id))
-                print(f"GPU: {self.gpu_id}, loss: {loss.item()}")
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+        if self.gpu_id == 0:
+            progress_bar = tqdm(total=self.num_iter, desc="Loss", dynamic_ncols=True)
+            self.setup_wandb()
 
-def main(rank, world_size, epochs):
+        train_dl_iter = iter(train_dl)
+        val_dl_iter = iter(val_dl)
+
+        train_loss = torch.tensor([], device=self.gpu_id)
+        num_no_consecutive_improvement = 0
+        val_losses = []
+        self.model.train()
+        for i in range(self.num_iter):
+            # each loop gives a batch of data as specified in the dataloader
+            try:
+                data, target = next(train_dl_iter)
+            except:
+                train_dl_iter = iter(train_dl)
+                data, target = next(train_dl_iter)
+
+            logits, loss = self.model(data.to(self.gpu_id), target.to(self.gpu_id))
+            train_loss = torch.cat((train_loss, torch.tensor([loss.item()], device=self.gpu_id)))
+            loss = loss / self.num_gradient_accum
+            loss.backward()
+
+            if (i+1)%self.num_gradient_accum == 0 or i == self.num_iter-1:
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
+            if i % eval_interval == 0:
+                self.model.eval()
+                val_loss = torch.tensor([], device=self.gpu_id)
+
+                for _ in range(eval_iters):
+                    try:
+                        data, target = next(val_dl_iter)
+                    except:
+                        val_dl_iter = iter(val_dl)
+                        data, target = next(val_dl_iter)
+
+                    with torch.no_grad():
+                        logits, loss = self.model(data.to(self.gpu_id), target.to(self.gpu_id))
+
+                    val_loss = torch.cat((val_loss, torch.tensor([loss.item()], device=self.gpu_id)))
+
+                dist.reduce(train_loss, dst=0)
+                dist.reduce(val_loss, dst=0)
+                if dist.get_rank() == 0:
+                    avg_train_loss = torch.sum(train_loss) / (len(train_loss)*self.world_size)
+                    avg_val_loss = torch.sum(val_loss) / (len(val_loss)*self.world_size)
+
+                    progress_bar.set_postfix({'Train': avg_train_loss.item(), 'Test': avg_val_loss.item()}, refresh=True)
+                    wandb.log({"train_loss": avg_train_loss.item(), "test_loss": avg_val_loss.item()}, step=i)
+
+                    val_losses.append(avg_val_loss.item())
+                    try:
+                        if min(test_losses) <= avg_val_loss.item():
+                            num_no_consecutive_improvement += 1
+                        elif num_no_consecutive_improvement > 0:
+                            num_no_consecutive_improvement = 0
+                    except:
+                        pass
+
+                train_loss = torch.tensor([], device=self.gpu_id)
+                self.model.train()
+
+            if i % save_interval == 0 and not i==0:
+                self.push_to_hub(i)
+
+            if dist.get_rank() == 0:
+                progress_bar.update(1)
+
+            if num_no_consecutive_improvement == 2:
+                self.lr_scheduling()
+
+        progress_bar.close()
+
+
+def main(rank, world_size, num_iter, num_gradient_accum, lr_scheduling_rate):
     ddp_setup(rank, world_size)
-    X_train, X_val, vocab_size = prepare_data()
+#     text = load_data()
+#     input_ids, vocab_size = tokenize(text)
+    input_ids, vocab_size = load_tokenized()
+    X_train, X_val = train_test_split(input_ids)
     model = GPTLanguageModel(rank, vocab_size)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     print(f"Total number of parameters: {sum(p.numel() for p in model.parameters())/1e6} M")
-    trainer = Trainer(rank, world_size, model, optimizer, epochs)
+    trainer = Trainer(rank, world_size, model, optimizer, learning_rate, num_iter, num_gradient_accum, lr_scheduling_rate)
     trainer.train(X_train, X_val)
     destroy_process_group()
 
 if __name__ == "__main__":
-    epochs = 2
+    num_iter = total_iters
     world_size = torch.cuda.device_count()
-    mp.spawn(main, args=(world_size, epochs), nprocs=world_size)
+    mp.spawn(main, args=(world_size, total_iters, num_gradient_accumulation, lr_scheduling_rate), nprocs=world_size)
